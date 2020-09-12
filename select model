@@ -1,0 +1,114 @@
+//server.c
+#include <sys/socket.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <ctype.h>
+#include <sys/select.h>
+#include <arpa/inet.h>
+#include <strings.h>
+#include <stdio.h>
+#include "wrap.h"
+
+#define SERV_PORT 7777 
+#define SERV_IP "127.0.0.1"
+
+#define MAXLINE 4096
+
+int main() {
+        int lfd, cfd, maxfd, sockfd;
+        struct sockaddr_in serv_addr, clie_addr;
+        socklen_t clie_addr_len;
+        int client[FD_SETSIZE]; //restore fds having connection with server
+        fd_set rset;            //read file descriptor set
+		    fd_set allset;          //back up set for rset
+        int nready;             //return value of select
+        char buf[MAXLINE], str[INET_ADDRSTRLEN];
+        int maxi, i, j;
+        int n;                  //result of read
+
+        lfd = Socket(AF_INET, SOCK_STREAM, 0);
+
+        //port multiplexing: the port used by server waiting for 2MSL can bu used again
+        int opt = 1;
+        setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        bzero(&serv_addr, sizeof(serv_addr));
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(SERV_PORT);
+        //serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        inet_pton(AF_INET, SERV_IP, &serv_addr.sin_addr.s_addr);
+        Bind(lfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+
+        Listen(lfd, 128);
+        maxfd = lfd; //maxfd used for the first argument of select
+        maxi = -1; //used as the cursor of array client
+
+        FD_ZERO(&allset);
+        FD_ZERO(&rset);
+        FD_SET(lfd, &allset);
+
+        for (i = 0; i < FD_SETSIZE; i++)
+                client[i] = -1;
+
+        while (1) {
+                rset = allset;
+                nready = select(maxfd + 1, &rset, NULL, NULL, NULL);
+                if (nready == -1)
+                        perr_exit("select error");
+
+                if (FD_ISSET(lfd, &rset)) { //new client request
+                        clie_addr_len = sizeof(clie_addr);
+                        cfd = Accept(lfd, (struct sockaddr *)&clie_addr, &clie_addr_len);
+                        printf("received from %s at port %d\n",
+                                        inet_ntop(AF_INET, &clie_addr.sin_addr, str, sizeof(str)),
+                                        ntohs(clie_addr.sin_port));
+
+                        for (i = 0; i < FD_SETSIZE; i++) { //add this new client to connected clients set
+                                if (client[i] < 0) {
+                                        client[i] = cfd;
+                                        break;
+                                }
+                        }
+
+                        if (i == FD_SETSIZE) {
+                                fputs("too many clients\n", stderr);
+                                exit(1);
+                        }
+
+                        if (maxfd < cfd) //update maxfd
+                                maxfd = cfd;
+                        if (maxi < i) //make sure maxi points to the last element of client
+                                maxi = i;
+                        FD_SET(cfd, &allset); //add this new client to listening set
+
+                        if (--nready == 0) //select function receives only a new client request this time
+                                continue;
+                }
+
+                for (i = 0; i <= maxi; i++) { //check those clients connected
+                        if ((sockfd = client[i]) < 0) //client[i] has closed
+                                continue;
+
+                        if (FD_ISSET(sockfd, &rset)) { //client[i] has sent some data this round
+                                if ((n = Read(sockfd, buf, MAXLINE)) == 0) { //client[i] has closed
+                                        Close(sockfd);
+                                        FD_CLR(sockfd, &allset); //not listen it any more
+                                        client[i] = -1;
+                                } else { //n > 0
+                                        for (j = 0; j < n; j++)
+                                                buf[j] = toupper(buf[j]);
+                                        //sleep(10); //not necessary, only for amplifying this handling procudure
+                                        Write(sockfd, buf, n);
+                                        Write(STDOUT_FILENO, buf, n);
+                                }
+                                if (--nready == 0) //there is only one read request(not new client request), so no need to check other clients in client set
+                                        break;
+                        }
+                }
+
+        }
+        Close(lfd);
+        
+        return 0;
+}
+                    
