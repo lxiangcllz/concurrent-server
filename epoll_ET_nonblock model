@@ -1,0 +1,108 @@
+//server.c
+#include <stdio.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <unistd.h>
+#include <strings.h>
+#include <sys/epoll.h>
+#include "wrap.h"
+
+#define SERV_PORT 7777
+#define SERV_IP "127.0.0.1"
+#define MAXLINE 10
+
+int main() {
+        int lfd, cfd, epfd;
+        int nready, n, flag;
+        char buf[MAXLINE], str[INET_ADDRSTRLEN];
+        struct sockaddr_in serv_addr, clie_addr;
+        socklen_t clie_addr_len;
+
+        lfd = Socket(AF_INET, SOCK_STREAM, 0); 
+
+        bzero(&serv_addr, sizeof(serv_addr));
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_port = htons(SERV_PORT);
+        inet_pton(AF_INET, SERV_IP, &serv_addr.sin_addr);
+        Bind(lfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+
+        Listen(lfd, 20);
+
+        printf("Accepting connection...\n");
+        clie_addr_len = sizeof(clie_addr);
+        cfd = Accept(lfd, (struct sockaddr *)&clie_addr, &clie_addr_len);
+        printf("received from client %s at port %d\n",
+                        inet_ntop(AF_INET, &clie_addr.sin_addr, str, MAXLINE),
+                        ntohs(clie_addr.sin_port));
+
+        struct epoll_event cevt, event[10];
+        epfd = epoll_create(10);
+
+        cevt.events = EPOLLIN | EPOLLET; //edge triggered listening
+
+        //set cfd as nonblock reading
+        flag = fcntl(cfd, F_GETFL);
+        flag |= O_NONBLOCK;
+        fcntl(cfd, F_SETFL, flag);
+
+        cevt.data.fd = cfd;
+        epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cevt);
+        while (1) {
+                printf("epoll_wait begin\n");
+                nready = epoll_wait(epfd, event, 10, -1);
+                printf("epoll_wait end with nready %d\n", nready);
+                if (event[0].data.fd == cfd) {
+                        while ( (n = Read(cfd, buf, MAXLINE / 2)) > 0 ) //nonblock reading, polling
+                                Write(STDOUT_FILENO, buf, n);
+                }
+        }
+        Close(cfd);
+        Close(epfd);
+
+        return 0;
+}
+
+//client.c
+#include <stdio.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <strings.h>
+#include "wrap.h"
+
+#define SERV_PORT 7777 
+#define SERV_IP "127.0.0.1"
+#define MAXLINE 10
+
+int main() {
+        int cfd;
+        struct sockaddr_in serv_addr;
+        char buf[MAXLINE];
+
+        cfd = Socket(AF_INET, SOCK_STREAM, 0); 
+
+        serv_addr.sin_family = AF_INET;
+        inet_pton(AF_INET, SERV_IP, &serv_addr.sin_addr);
+        serv_addr.sin_port = htons(SERV_PORT);
+
+        Connect(cfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+
+        char ch = 'a';
+        int i;
+        while (1) {
+                for (i = 0; i < MAXLINE / 2; i++)
+                        buf[i] = ch;
+                buf[i - 1] = '\n';
+                ch++;
+                for ( ; i < MAXLINE; i++)
+                        buf[i] = ch;
+                buf[i - 1] = '\n';
+                ch++;
+                Write(cfd, buf, MAXLINE);
+                sleep(3);
+        }
+        Close(cfd);
+
+        return 0;
+}
