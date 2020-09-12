@@ -1,0 +1,261 @@
+#include <stdio.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+
+#define MAX_EVENTS 1024
+#define BUFLEN 4096 //max number of listening
+#define SERV_PORT 8080
+
+void recvdata(int fd, int events, void *arg);
+void senddata(int fd, int events, void *arg);
+
+//information about a ready fd(i.e. a client or listening end of server lfd)
+struct myevent_s {
+        int fd; //fd to be listened
+        int events; //corresponding event: EPOLLIN\EPOLLOUT
+        void *arg; //generic argument
+        void (*call_back)(int fd, int events, void *arg); //call back function
+        int status; //whether fd is in the listening tree
+        char buf[BUFLEN]; //restore data buffered
+        int len; //length of buf
+        long last_active; //last active time of fd in the listening tree
+};
+
+int g_efd; //return of epoll_create (global variable)
+struct myevent_s g_events[MAX_EVENTS + 1]; //MAX_EVENTS: max number of cfd, 1: lfd
+
+//initialize the struct myevent_s pointed to by ev
+void eventset(struct myevent_s *ev, int fd, void (*call_back)(int, int, void *), void *arg) {
+        ev->fd = fd;
+        ev->events = 0;
+        ev->arg = arg; //point to itself
+        ev->call_back = call_back;
+        ev->status = 0;
+        memset(ev->buf, 0, sizeof(ev->buf));
+        ev->len = 0;
+        ev->last_active = time(NULL);
+
+        return;
+}
+
+//add the struct myevent_s pointed to by ev to listening tree efd with event specified by events 
+void eventadd(int efd, int events, struct myevent_s *ev) {
+        struct epoll_event epv = {0, {0}};
+        int op;
+        epv.data.ptr = ev; //point to a struct myevent_s
+        epv.events = ev->events = events;
+
+        if (ev->status == 1)
+                op = EPOLL_CTL_MOD;
+        else { //not in the listening tree
+                op = EPOLL_CTL_ADD;
+                ev->status = 1;
+        }
+
+        if (epoll_ctl(efd, op, ev->fd, &epv) < 0)
+                printf("event add failed [fd=%d], events[%d]", ev->fd, events);
+        else
+                printf("event add ok [fd=%d], op=%d, events[%0X]\n", ev->fd, op, events);
+
+        return;
+}
+
+//delete a fd from listening tree efd
+void eventdel(int efd, struct myevent_s *ev) {
+        struct epoll_event epv = {0, {0}};
+
+        if (ev->status != 1)
+                return;
+
+        epv.data.ptr = ev;
+        ev->status = 0; //modify the status of ev
+        epoll_ctl(efd, EPOLL_CTL_DEL, ev->fd, &epv); //delete ev from efd
+
+        return;
+}
+
+//call back function for a new connected client
+void acceptconn(int lfd, int events, void *arg) {
+        struct sockaddr_in cin;
+        socklen_t len = sizeof(cin);
+        int cfd, i;
+
+        if ( (cfd = accept(lfd, (struct sockaddr *)&cin, &len)) == -1) {
+                if (errno != EAGAIN && errno != EINTR) {
+                        //don't handle it now
+                }
+                printf("%s: accept, %s\n", __func__, strerror(errno));
+                return;
+        }
+
+        do {
+                for (i = 0; i < MAX_EVENTS; i++)
+                        if (g_events[i].status == 0) //find a element not been used for cfd
+                                break; //go out of the for loop
+
+                if (i == MAX_EVENTS) {
+                        printf("%s: max connect limit[%d]\n", __func__, MAX_EVENTS);
+                        break; //go out of the do-while(0) loop
+                }
+
+                int flag = 0;
+                if ( (flag = fcntl(cfd, F_SETFL, O_NONBLOCK)) < 0) { //set cfd as non-block
+                        printf("%s: fcntl nonblocking failed, %s\n", __func__, strerror(errno));
+                }
+
+                //specify a struct myevent_s g_events[i] for cfd, whose call_back is set as recvdata
+                eventset(&g_events[i], cfd, recvdata, &g_events[i]);
+
+                //add cfd's struct myevent_s to listening tree g_efd
+                eventadd(g_efd, EPOLLIN, &g_events[i]);
+
+        } while (0);
+
+        printf("new connect [%s:%d][time:%ld], pos[%d]\n",
+                        inet_ntoa(cin.sin_addr), ntohs(cin.sin_port), g_events[i].last_active, i);
+
+        return;
+}
+
+//call back function for a connected client
+//waiting for epoll_wait returning -> cfd -> set cfd as EPOLLIN -> read -> remove cfd -> 
+//set cfd as EPOLLOUT -> add cfd to listening tree again -> handle data -> waiting for epoll_wait returning
+//-> write data handled back to client through cfd -> remove cfd -> set cfd as EPOLLIN ->
+//waiting for epoll_wait returning -> ...
+void recvdata(int fd, int events, void *arg) {
+        struct myevent_s *ev = (struct myevent_s *)arg;
+        int len;
+
+        len = recv(fd, ev->buf, sizeof(ev->buf), 0); //recv with last argument set as 0 is same as read
+        eventdel(g_efd, ev); //delete this cfd from g_efd
+
+        if (len > 0) {
+                //handle the data read from client
+                ev->len = len;
+                ev->buf[len] = '\0';
+                printf("C[%d]: %s\n", fd, ev->buf);
+
+                eventset(ev, fd, senddata, ev); //set fd's call back function as senddata
+                eventadd(g_efd, EPOLLOUT, ev); //add this ev to listening tree with event EPOLLOUT
+
+        } else if (len == 0) {
+                close(ev->fd);
+                printf("[fd=%d] pos[%ld], closed\n", fd, ev - g_events);
+        } else {
+                close(ev->fd);
+                printf("recv[fd=%d] error[%d]: %s\n", fd, errno, strerror(errno));
+        }
+
+        return;
+}
+
+void senddata(int fd, int events, void *arg) {
+        struct myevent_s *ev = (struct myevent_s *)arg;
+        int len;
+
+        len = send(fd, ev->buf, ev->len, 0); //send with last argument set as 0 is same as write 
+
+        if (len > 0) {
+                printf("send[fd=%d], [%d]%s\n", fd, len, ev->buf);
+                eventdel(g_efd, ev); //remove fd from g_efd
+                eventset(ev, fd, recvdata, ev); //set its call back function as recvdata again
+                eventadd(g_efd, EPOLLIN, ev); //add it to g_efd again with event EPOLLIN
+        } else {
+                close(ev->fd);
+                eventdel(g_efd, ev);
+                printf("send[fd=%d] error %s\n", fd, strerror(errno));
+        }
+
+        return;
+}
+
+
+//create and initialize lfd, and add it to listening tree efd
+void initlistensocket(int efd, short port) {
+        int lfd = socket(AF_INET, SOCK_STREAM, 0);
+        fcntl(lfd, F_SETFL, O_NONBLOCK);
+
+        //void eventset(struct myevent_s *ev, int fd, void (*call_back)(int, int, void *), void *arg)
+        eventset(&g_events[MAX_EVENTS], lfd, acceptconn, &g_events[MAX_EVENTS]);
+
+        //void eventadd(int efd, int events, struct myevent_s *ev)
+        eventadd(efd, EPOLLIN, &g_events[MAX_EVENTS]);
+
+        struct sockaddr_in sin;
+        memset(&sin, 0, sizeof(sin));
+        sin.sin_family = AF_INET;
+        sin.sin_addr.s_addr = INADDR_ANY;
+        sin.sin_port = htons(port);
+        bind(lfd, (struct sockaddr *)&sin. sizeof(sin));
+
+        listen(lfd, 20);
+
+        return;
+}
+
+int main(int argc, char *argv[]) {
+        unsigned short port = SERV_PORT;
+
+        if (argc == 2)
+                port = atoi(argv[1]);
+
+        g_efd = epoll_create(MAX_EVENTS + 1); //create a epoll listening tree
+        if (g_efd <= 0)
+                printf("create efd in %s err %s\n", __func__, strerror(errno));
+
+        initlistensocket(g_efd, port); //initializing listening tree
+
+        struct epoll_event events[MAX_EVENTS + 1]; //restore ready fds
+        printf("server running : port[%d]\n", port);
+
+        int checkpos = 0;
+        int i;
+
+        while (1) {
+
+                //check those non-active clients during the check time period 
+                long now = time(NULL); //present time since Epoch
+                for (i = 0; i < 100; i++, checkpos++) { //100 ready fds are checked during one loop
+                        if (checkpos == MAX_EVENTS)
+                                checkpos = 0;
+                        if (g_events[checkpos].status != 1) //not in the listening tree
+                                continue;
+
+                        long duration = now - g_events[checkpos].last_active; //non-active time period
+                        if (duration >= 60) {
+                                close(g_events[checkpos].fd); //close the connection with this fd
+                                printf("[fd=%d] timeout\n", g_events[checkpos].fd);
+                                eventdel(g_efd, &g_events[checkpos]); //delete this fd from listening tree
+                        }
+                }
+
+                //listen to the listening tree g_efd, and add those ready fds into array events
+                int nfd = epoll_wait(g_efd, events, MAX_EVENTS + 1, 1000); //waiting for 1s
+                if (nfd < 0) {
+                        printf("epoll_wait error, exit\n");
+                        break;
+                }
+
+                for (i = 0; i < nfd; i++) {
+                        struct myevent_s *ev = (struct myevent_s *)events[i].data.ptr;
+
+                        if ((events[i].events & EPOLLIN) && (ev->events & EPOLLIN)) { //read event is ready
+                                ev->call_back(ev->fd, events[i].events, ev->arg);
+                        }
+                        if ((events[i].events & EPOLLOUT) && (ev->events & EPOLLOUT)) { //write event is ready
+                                ev->call_back(ev->fd, events[i].events, ev->arg);
+                        }
+                }
+        }
+
+        //free all the resources before return 
+
+        return 0;
+}
